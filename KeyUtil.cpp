@@ -24,8 +24,10 @@
 #include <fcntl.h>
 #include <linux/blk-crypto.h>
 #include <linux/fscrypt.h>
+#include <keyutils.h>
 #include <openssl/sha.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -48,6 +50,24 @@ using android::fscrypt::KeyType;
 // This must be acquired before calling fscrypt ioctls that operate on keys.
 // This prevents race conditions between evicting and reinstalling keys.
 static std::mutex fscrypt_keyring_mutex;
+
+// Android 17 supports the filesystem key-management ioctls, but this device's
+// 4.4 kernel only has the older global keyring interface.  Keep the probe local
+// and use the legacy path only for v1 policies, which remain compatible with
+// this kernel's on-disk format.
+static bool isFsKeyringSupported(const std::string& mountpoint) {
+    // Do not cache failed opens or a result from a different filesystem.
+    // Only ENOTTY proves the ioctl is unavailable; all other failures stay
+    // on the normal ioctl path and are reported by the actual operation.
+    android::base::unique_fd fd(open(mountpoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (fd == -1) {
+        PLOG(ERROR) << "Failed to open " << mountpoint << " while probing fscrypt key ioctls";
+        return true;
+    }
+    errno = 0;
+    const int result = ioctl(fd, FS_IOC_ADD_ENCRYPTION_KEY, nullptr);
+    return result != -1 || errno != ENOTTY;
+}
 
 const KeyGeneration neverGen() {
     return KeyGeneration{0, false, KeyType::kRaw};
@@ -233,6 +253,97 @@ static std::string keyrefstring(const std::string& raw_ref) {
     return o.str();
 }
 
+static std::string buildLegacyKeyName(const std::string& prefix, const std::string& raw_ref) {
+    return prefix + ":" + keyrefstring(raw_ref);
+}
+
+// Get the keyring created by init for kernels that predate the filesystem key
+// management ioctls.  The legacy 4.4 ext4 implementation looks up keys by the
+// ext4:<descriptor> name; the additional prefixes preserve f2fs compatibility.
+static bool fscryptKeyring(key_serial_t* device_keyring) {
+    *device_keyring = keyctl_search(KEY_SPEC_SESSION_KEYRING, "keyring", "fscrypt", 0);
+    if (*device_keyring == -1) {
+        PLOG(ERROR) << "Unable to find fscrypt keyring";
+        return false;
+    }
+    return true;
+}
+
+static bool fillLegacyKey(const KeyBuffer& key, fscrypt_key* fs_key) {
+    if (key.size() != FSCRYPT_MAX_KEY_SIZE) {
+        LOG(ERROR) << "Wrong size key for legacy fscrypt: " << key.size();
+        return false;
+    }
+    fs_key->mode = 0;  // Unused by the legacy kernel implementation.
+    memcpy(fs_key->raw, key.data(), key.size());
+    fs_key->size = key.size();
+    return true;
+}
+
+static bool evictKeyLegacy(const std::string& raw_ref);
+
+static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
+    KeyBuffer fs_key_buffer(sizeof(fscrypt_key), 0);
+    auto& fs_key = *reinterpret_cast<fscrypt_key*>(fs_key_buffer.data());
+    if (!fillLegacyKey(key, &fs_key)) return false;
+
+    key_serial_t device_keyring;
+    if (!fscryptKeyring(&device_keyring)) return false;
+
+    static const char* const name_prefixes[] = {"ext4", "f2fs", "fscrypt", nullptr};
+    for (const char* const* prefix = name_prefixes; *prefix != nullptr; ++prefix) {
+        const auto ref = buildLegacyKeyName(*prefix, raw_ref);
+        const key_serial_t key_id =
+                add_key("logon", ref.c_str(), &fs_key, sizeof(fs_key), device_keyring);
+        if (key_id == -1) {
+            PLOG(ERROR) << "Failed to insert legacy fscrypt key into keyring "
+                        << device_keyring;
+            if (!evictKeyLegacy(raw_ref)) {
+                LOG(FATAL) << "Failed to roll back partially installed legacy fscrypt key";
+            }
+            return false;
+        }
+        // Filesystem users need search to resolve this key.  Vold (root) also
+        // needs write if add_key updates an existing logon key with this name.
+        // Unlinking needs write on the containing keyring, not on this key.
+        // Retain owner setattr if add_key returns an existing key to restrict.
+        constexpr uint32_t kLegacyFscryptKeyPerms =
+                KEYUTILS_POS_SEARCH | KEYUTILS_USR_VIEW | KEYUTILS_USR_WRITE |
+                KEYUTILS_USR_SEARCH | KEYUTILS_USR_SETATTR;
+        if (syscall(__NR_keyctl, KEYCTL_SETPERM, key_id, kLegacyFscryptKeyPerms) == -1) {
+            PLOG(ERROR) << "Failed to restrict permissions on legacy fscrypt key " << key_id;
+            if (!evictKeyLegacy(raw_ref)) {
+                LOG(FATAL) << "Failed to remove unrestricted legacy fscrypt key";
+            }
+            return false;
+        }
+        LOG(DEBUG) << "Added legacy fscrypt key " << key_id << " (" << ref << ") to keyring "
+                   << device_keyring;
+    }
+    return true;
+}
+
+static bool evictKeyLegacy(const std::string& raw_ref) {
+    key_serial_t device_keyring;
+    if (!fscryptKeyring(&device_keyring)) return false;
+
+    bool success = true;
+    static const char* const name_prefixes[] = {"ext4", "f2fs", "fscrypt", nullptr};
+    for (const char* const* prefix = name_prefixes; *prefix != nullptr; ++prefix) {
+        const auto ref = buildLegacyKeyName(*prefix, raw_ref);
+        const auto key_id = keyctl_search(device_keyring, "logon", ref.c_str(), 0);
+        if (key_id == -1) {
+            if (errno == ENOKEY) continue;  // Missing aliases are already evicted.
+            PLOG(ERROR) << "Failed to find legacy fscrypt key " << ref;
+            success = false;
+        } else if (keyctl_unlink(key_id, device_keyring) != 0) {
+            PLOG(ERROR) << "Failed to unlink legacy fscrypt key " << ref;
+            success = false;
+        }
+    }
+    return success;
+}
+
 // Build a struct fscrypt_key_specifier for use in the key management ioctls.
 static bool buildKeySpecifier(fscrypt_key_specifier* spec, const EncryptionPolicy& policy) {
     switch (policy.options.version) {
@@ -282,6 +393,13 @@ bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
                 policy->key_raw_ref = generateKeyRef((const uint8_t*)key.data(), key.size()/2);
             } else {
                 policy->key_raw_ref = generateKeyRef((const uint8_t*)key.data(), key.size());
+            }
+            if (!isFsKeyringSupported(mountpoint)) {
+                if (options.key_type != KeyType::kRaw) {
+                    LOG(ERROR) << "Legacy fscrypt does not support hardware-wrapped keys";
+                    return false;
+                }
+                return installKeyLegacy(key, policy->key_raw_ref);
             }
             if (!buildKeySpecifier(&arg->key_spec, *policy)) {
                 return false;
@@ -402,6 +520,10 @@ static void waitForBusyFiles(const struct fscrypt_key_specifier key_spec, const 
 
 bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy) {
     const std::lock_guard<std::mutex> lock(fscrypt_keyring_mutex);
+
+    if (policy.options.version == 1 && !isFsKeyringSupported(mountpoint)) {
+        return evictKeyLegacy(policy.key_raw_ref);
+    }
 
     android::base::unique_fd fd(open(mountpoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (fd == -1) {
