@@ -280,7 +280,7 @@ static bool fillLegacyKey(const KeyBuffer& key, fscrypt_key* fs_key) {
     return true;
 }
 
-static bool evictKeyLegacy(const std::string& raw_ref);
+static bool rollbackLegacyKey(const std::string& raw_ref);
 
 static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
     KeyBuffer fs_key_buffer(sizeof(fscrypt_key), 0);
@@ -298,7 +298,7 @@ static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
         if (key_id == -1) {
             PLOG(ERROR) << "Failed to insert legacy fscrypt key into keyring "
                         << device_keyring;
-            if (!evictKeyLegacy(raw_ref)) {
+            if (!rollbackLegacyKey(raw_ref)) {
                 LOG(FATAL) << "Failed to roll back partially installed legacy fscrypt key";
             }
             return false;
@@ -312,7 +312,7 @@ static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
                 KEYUTILS_USR_SEARCH | KEYUTILS_USR_SETATTR;
         if (syscall(__NR_keyctl, KEYCTL_SETPERM, key_id, kLegacyFscryptKeyPerms) == -1) {
             PLOG(ERROR) << "Failed to restrict permissions on legacy fscrypt key " << key_id;
-            if (!evictKeyLegacy(raw_ref)) {
+            if (!rollbackLegacyKey(raw_ref)) {
                 LOG(FATAL) << "Failed to remove unrestricted legacy fscrypt key";
             }
             return false;
@@ -323,7 +323,7 @@ static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
     return true;
 }
 
-static bool evictKeyLegacy(const std::string& raw_ref) {
+static bool rollbackLegacyKey(const std::string& raw_ref) {
     key_serial_t device_keyring;
     if (!fscryptKeyring(&device_keyring)) return false;
 
@@ -342,6 +342,17 @@ static bool evictKeyLegacy(const std::string& raw_ref) {
         }
     }
     return success;
+}
+
+// Legacy alias removal cannot clear per-inode cached encryption transforms.
+// Keep it private to installation rollback; never report it as key eviction.
+bool isKeyEvictionSupported(const std::string& mountpoint, const EncryptionPolicy& policy) {
+    if (policy.options.version == 1 && !isFsKeyringSupported(mountpoint)) {
+        LOG(ERROR) << "Legacy fscrypt key eviction is unsupported on " << mountpoint;
+        errno = EOPNOTSUPP;
+        return false;
+    }
+    return true;
 }
 
 // Build a struct fscrypt_key_specifier for use in the key management ioctls.
@@ -521,9 +532,7 @@ static void waitForBusyFiles(const struct fscrypt_key_specifier key_spec, const 
 bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy) {
     const std::lock_guard<std::mutex> lock(fscrypt_keyring_mutex);
 
-    if (policy.options.version == 1 && !isFsKeyringSupported(mountpoint)) {
-        return evictKeyLegacy(policy.key_raw_ref);
-    }
+    if (!isKeyEvictionSupported(mountpoint, policy)) return false;
 
     android::base::unique_fd fd(open(mountpoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (fd == -1) {

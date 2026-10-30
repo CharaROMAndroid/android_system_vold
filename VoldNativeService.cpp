@@ -25,6 +25,7 @@
 #include <private/android_filesystem_config.h>
 #include <utils/Trace.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <fstream>
 #include <thread>
@@ -703,7 +704,13 @@ binder::Status VoldNativeService::lockCeStorage(int32_t userId) {
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_CRYPT_LOCK;
 
-    return translateBool(fscrypt_lock_ce_storage(userId));
+    errno = 0;
+    const bool success = fscrypt_lock_ce_storage(userId);
+    if (!success && errno == EOPNOTSUPP) {
+        return binder::Status::fromServiceSpecificError(
+                EOPNOTSUPP, String8("Legacy fscrypt cannot lock cached CE inode keys"));
+    }
+    return translateBool(success);
 }
 
 binder::Status VoldNativeService::prepareUserStorage(const std::optional<std::string>& uuid,

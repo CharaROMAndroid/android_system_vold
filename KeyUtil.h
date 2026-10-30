@@ -60,6 +60,11 @@ bool prepareKeyForUse(const KeyBuffer& lt_key, android::fscrypt::KeyType type,
 bool installKey(const std::string& mountpoint, const android::fscrypt::EncryptionOptions& options,
                 const KeyBuffer& key, android::fscrypt::EncryptionPolicy* policy);
 
+// Preflight key eviction without removing keys. False with EOPNOTSUPP for
+// legacy session-keyring policies whose cached inode keys cannot be evicted.
+bool isKeyEvictionSupported(const std::string& mountpoint,
+                            const android::fscrypt::EncryptionPolicy& policy);
+
 // Evict a file-based encryption key from the kernel.
 bool evictKey(const std::string& mountpoint, const android::fscrypt::EncryptionPolicy& policy);
 

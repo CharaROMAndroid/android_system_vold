@@ -714,11 +714,21 @@ static bool evict_user_keys(std::map<userid_t, UserPolicies>& policy_map, userid
     auto it = policy_map.find(user_id);
     if (it != policy_map.end()) {
         const UserPolicies& policies = it->second;
+        // Preflight every volume before removing any key or policy tracking.
+        // Legacy alias unlinking does not lock cached, encrypted inodes.
+        if (!android::vold::isKeyEvictionSupported(BuildDataPath(""), policies.internal)) {
+            return false;
+        }
+        for (const auto& [volume_uuid, policy] : policies.adoptable) {
+            if (!android::vold::isKeyEvictionSupported(BuildDataPath(volume_uuid), policy)) {
+                return false;
+            }
+        }
         success &= android::vold::evictKey(BuildDataPath(""), policies.internal);
         for (const auto& [volume_uuid, policy] : policies.adoptable) {
             success &= android::vold::evictKey(BuildDataPath(volume_uuid), policy);
         }
-        policy_map.erase(it);
+        if (success) policy_map.erase(it);
     }
     return success;
 }
