@@ -946,13 +946,17 @@ int VolumeManager::handleAppStorageDirs(int uid, int pid,
     // Only run the remount if fuse is mounted for that user.
     userid_t userId = multiuser_get_user_id(uid);
     bool fuseMounted = false;
-    for (auto& vol : mInternalEmulatedVolumes) {
-        if (vol->getMountUserId() == userId && vol->getState() == VolumeBase::State::kMounted) {
-            auto* emulatedVol = static_cast<android::vold::EmulatedVolume*>(vol.get());
-            if (emulatedVol) {
-                fuseMounted = emulatedVol->isFuseMounted();
+    {
+        // Snapshot mounted state, then release mLock before setupAppDir takes it.
+        std::lock_guard<std::mutex> lock(mLock);
+        for (auto& vol : mInternalEmulatedVolumes) {
+            if (vol->getMountUserId() == userId && vol->getState() == VolumeBase::State::kMounted) {
+                auto* emulatedVol = static_cast<android::vold::EmulatedVolume*>(vol.get());
+                if (emulatedVol) {
+                    fuseMounted = emulatedVol->isFuseMounted();
+                }
+                break;
             }
-            break;
         }
     }
     if (fuseMounted) {
